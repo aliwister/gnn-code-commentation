@@ -1,153 +1,135 @@
-import csv
-import numpy as np
-import torch
-from argparse import ArgumentParser
+from accelerate import Accelerator
+from accelerate.utils import gather_object
 import pandas as pd
-from torch_geometric.loader import DataLoader
+import torch, time
+from tqdm import tqdm
+from argparse import ArgumentParser
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from sklearn.cluster import KMeans
-from math import ceil
-import matplotlib.pyplot as plt
-from sklearn.metrics.pairwise import cosine_similarity
+#from util.chatgpt import run_chatgpt
+from run_prompts import run_prompts
 
-from transformers import GPTJForCausalLM, AutoTokenizer
-from model.gnn_encoder import GNNModel
-import evaluate
-from util.graph import create_graph
-from util.prompt import create_incontext_prompt, get_answer
-from train import encode
-import pdb
+from util.measure import measure
+from pathlib import Path
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-def process_string_to_array(string):
-    stripped_string = string.strip('[]')
-    array = np.array([float(num) for num in stripped_string.split()])
-    return array
+accelerator = Accelerator()
+models = {
+    "llama-3-8B": ("meta-llama/Meta-Llama-3-8B-Instruct", 8192),
+    "zephy7B": ("HuggingFaceH4/zephyr-7b-beta", 32768),
+    "gemma-7B": ("google/gemma-7b", 8192),
+    "Qwen-2-7B": ("Qwen/Qwen2-7B-Instruct", 32768),
+    "mistral-7B": ("mistralai/Mistral-7B-v0.1", 2048),
+    "openchat-8B": ("openchat/openchat-3.6-8b-20240522", 8192),
+    "WizardLM-2-7B": ("lucyknada/microsoft_WizardLM-2-7B", 32768),
+    "gpt-j-6b": ("EleutherAI/gpt-j-6B", 2048)
+}
 
-def load_training_set_with_logits(dataset_train_raw, dataset_train_logits):
-    df_train_raw = pd.read_csv(dataset_train_raw)
-    dtype_dict = {'idx': int, 'rep': str}
-    df_train_processed = pd.read_csv(dataset_train_logits, dtype=dtype_dict)
-    df_train_processed['data'] = df_train_processed['rep'].apply(process_string_to_array)
-    name_to_question_text = df_train_raw['question_text'].to_dict()
-    name_to_program_text = df_train_raw['decomposition'].to_dict()
-    df_train_processed['question_text'] = df_train_processed['idx'].map(name_to_question_text)
-    df_train_processed['decomposition'] = df_train_processed['idx'].map(name_to_program_text)
-    return df_train_processed
+def get_filename(input_csv):
+    # Get the file name without directory and extension
+    filename = Path(input_csv).stem
+    return filename
 
-def cluster_data(df, n_clusters):
-    kmeans = KMeans(n_clusters=45)
-    labels_train = kmeans.fit_predict(list(df['data'].values))
-    return kmeans, labels_train
+def generate_text(model, tokenizer, max_tokens, prompt):
+        prompt_tokenized = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_tokens).to("cuda")
+        output_tokenized = model.generate(
+            **prompt_tokenized, 
+            temperature=1,       # Control the randomness of the output
+            top_p=1,             # Use nucleus sampling
+            top_k=50,              # Use top-k sampling
+            num_return_sequences=1, 
+            max_new_tokens=100
+            )[0]
 
-def get_samples(df, cluster, num):
-    fdf = df
-    if cluster > -1:
-        fdf = df[df['label'] == cluster]
-    r = fdf.sample(n=5)
-    #pdb.set_trace()
-    #if cluster > -1:
-    #print(r)
-    if (num ==2):
-        return r.iloc[0]['decomposition'], r.iloc[0]['question_text'], r.iloc[1]['decomposition'], r.iloc[1]['question_text']
-    if (num==1):
-        return r.iloc[0]['decomposition'], r.iloc[0]['question_text']
+        input_length = len(prompt_tokenized['input_ids'][0])
+        generated_text = tokenizer.decode(output_tokenized[input_length:], skip_special_tokens=True) 
+        generated_text = generated_text.split('#')[0]
+
+        return generated_text
+
+
+def run_prompts(model_name, prompts_all, references, output_csv): 
+    
+    model_config = models[model_name]
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_config[0],    
+        device_map={"": accelerator.process_index},
+        torch_dtype=torch.bfloat16
+    )
+    tokenizer = AutoTokenizer.from_pretrained(model_config[0])   
+    
+    # sync GPUs and start the timer
+    accelerator.wait_for_everyone()
+    start=time.time()
+    if accelerator.is_main_process:
+        pbar=tqdm(total=len(prompts_all))    
+    # divide the prompt list onto the available GPUs 
+    with accelerator.split_between_processes(prompts_all) as prompts:
+        # store output of generations in dict
+        results=dict(outputs=[], num_tokens=0)
+        #print(len(prompts))
+        #model = model.to(device)
+        # have each GPU do inference, prompt by prompt
+        for prompt in prompts:
+            result = generate_text(model, tokenizer, model_config[1], prompt)
+            #generated_text = generated_text.split('#')[0]
+
+            results["outputs"].append(result)
+            results["num_tokens"] += len(result)
+           
+            time.sleep(0.1)
+            accelerator.wait_for_everyone()
+            if accelerator.is_main_process:
+                pbar.update( accelerator.num_processes )
+
+        results=[ results ] # transform to list, otherwise gather_object() will not collect correctly
+
+    # collect results from all the GPUs
+    results_gathered=gather_object(results)
+
+    if accelerator.is_main_process:
+        timediff=time.time()-start
+        num_tokens=sum([r["num_tokens"] for r in results_gathered ])
+
+        df = pd.DataFrame(results_gathered[0]['outputs'])
+        df.to_csv(output_csv, index=False)
+        print(f"{output_csv}, tokens/sec: {num_tokens//timediff}, time {timediff}, total tokens {num_tokens}, total prompts {len(prompts_all)}")
+        file_path = 'EXPERIMENTS_SUMMARY.txt'
+        with open(file_path, 'a') as file:
+            file.write(f"{output_csv}, tokens/sec: {num_tokens//timediff}, time {timediff}, total tokens {num_tokens}, total prompts {len(prompts_all)}\n")
+            measure(output_csv, timediff, references)
+
+
+def run_transformer(args, df):
+    if args.limit > 0:
+        df = df[0:args.limit]
+
+    prompts_all = df['prompt1'].to_numpy().flatten()
+    references = df['ref'].tolist()
+
+    output_csv = f"{args.output_dir}/{get_filename(args.input_csv)}.{args.model_name}.csv"
+    if (args.model_name == "openai/chatgptxxxx"):
+        #run_chatgpt(args.langmodel_name_model, prompts_all, output_file)
+        exit(-1)
+    else:
+        run_prompts(args.model_name, prompts_all, references, output_csv)
+        
+    
 
 if __name__ == '__main__':
     parser = ArgumentParser()
-    parser.add_argument('--dataset_train_raw', type=str, default='/home/ali.lawati/gnn-incontext/data/Break-dataset/logical-forms/dev.csv')
-    parser.add_argument('--dataset_train_logits', type=str, default='/home/ali.lawati/gnn-incontext/logits10.csv')
-    parser.add_argument('--dataset_test', type=str, default='/home/ali.lawati/gnn-incontext/data/Break-dataset/logical-forms/simple-test.csv')
-    parser.add_argument('--saved_gnn_model', type=str, default="gnn10.pt") 
-    parser.add_argument('--lang_model', type=str, default="EleutherAI/gpt-j-6B") 
-    args = parser.parse_args()
-
-
-    model = GNNModel()
-    model.load_state_dict(torch.load(args.saved_gnn_model))
-    model.to(device)
-    lang_model = GPTJForCausalLM.from_pretrained(args.lang_model, torch_dtype=torch.float16, low_cpu_mem_usage=True, device_map = 'auto').to(torch.float16).eval()
-    tokenizer = AutoTokenizer.from_pretrained(args.lang_model)
-    tokenizer.pad_token = tokenizer.eos_token
-    #tokenizer.padding_side = 'left'
-
-    df_train = load_training_set_with_logits(args.dataset_train_raw, args.dataset_train_logits)
-
-    df_test = pd.read_csv(args.dataset_test)
-    data = DataLoader(df_test[:].apply(lambda x: create_graph(x['program'], tokenizer, x.name), axis=1).tolist(), batch_size=8, shuffle=False)
-    test_idx, test_reps = encode(model, data, lang_model, device)
-
-    kmeans, df_train['label'] = cluster_data(df_train, 45)
-    #pdb.set_trace()
-
-    test_reps = np.array(test_reps).astype(np.float64)
-    labels_test = kmeans.predict(test_reps)
-
-    predictions1, predictions2, predictions3, references = [], [], [], []
-    prompts1, prompts2 = [], []
-
-    batch_size = 16
-    for i in range(0, len(test_idx)):
-        prog = df_test.iloc[i]['decomposition']
-        print(prog, df_test.iloc[i]['question_text'])
-        p_args1 = get_samples(df_train, -1, 2) + (prog,)
-        p_args2 = get_samples(df_train, labels_test[i], 2) + (prog,)
-        prompt1 = create_incontext_prompt(*p_args1)
-        prompt2 = create_incontext_prompt(*p_args2)
-        prompts1.append(prompt1)
-        prompts2.append(prompt2)
-        references.append(df_test.iloc[i]['question_text'])
-
-        #prompts1.extend(batch_prompt1)
-        #prompts2.extend(batch_prompt2)
-        #prompt2 = create_incontext_prompt(get_samples(df_train, labels_test[i]))
-        #response1 = get_answer(batch_prompt1, lang_model, tokenizer, device)
-        #response2 = get_answer(batch_prompt2, lang_model, tokenizer, device)
-        
-        #predictions1.extend(response1)
-        #predictions2.extend(response2)
-        #predictions3.append(response3)
-
-    data_dict = {
-        'prompt1': np.squeeze(prompts1),      # First array as the 'ID' column
-        'prompt2': np.squeeze(prompts2),    # Second array as the 'Name' column
-        'ref': references      # Third array as the 'Age' column
-    }
-    df = pd.DataFrame(data_dict)
-    df.to_csv('./test/prompts', index=False)
-
-    """with open("prompts-answer10.csv", 'w') as f:
-        writer = csv.writer(f)
-            # Write header (optional)
-        writer.writerow(['ref', 'pred1', 'pred2'])
-        
-        # Write each row with one element from each list
-        for item1, item2, item3 in zip(references, np.squeeze(predictions1), np.squeeze(predictions2)):
-            writer.writerow([item1, item2, item3])    
-    #pdb.set_trace()
-    bleu_metric = evaluate.load("bleu")
-    result = bleu_metric.compute(predictions=np.squeeze(predictions1), references=references)
-    print("BLEU score:", result["bleu"])
-
-    result = bleu_metric.compute(predictions=np.squeeze(predictions2), references=references)
-    print("BLEU score:", result["bleu"])
-    """
-    #result = bleu_metric.compute(predictions=np.squeeze(predictions3), references=references)
-    #print("BLEU score:", result["bleu"])
-
-    """cluster = labels_test[i]
-    rep = test_reps[i]
-    df_train_filter = df_train[df_train['label']==1]
-    # Calculate cosine similarity between the given value and each array in the 'data' column
-    similarities = cosine_similarity(df_train_filter['data'].tolist(), rep.reshape(1, -1))
-
-    # Convert similarities to a 1D array for easier processing
-    similarities = similarities.ravel()
-
-    # Find the top three highest cosine similarities and their indices
-    top_3_indices = np.argsort(similarities)[-3:]  # Get indices of the highest 3 values
-    top_3_similarities = similarities[top_3_indices]"""
-
-
-
-
+    parser.add_argument('--method', type=str, default="icl-top")
+    parser.add_argument('--output_dir', type=str, default='/home/ali.lawati/mol-incontext/output')
+    parser.add_argument('--model_name', type=str, default="gpt-j-6b") 
+    parser.add_argument('--input_csv', type=str, default='/home/ali.lawati/gnn-incontext/input/cosql-icl-top-2.csv')
+    parser.add_argument('--n_clusters', type=int, default=5)
+    parser.add_argument('--limit', type=int, default=-1) 
+    
+    args = parser.parse_args() 
+    print("Manual Input CSV")
+    df = pd.read_csv(args.input_csv)
+    prompts = df['prompt1'].values
+    ref = df['ref'].values
+    #run_transformer(args, df)
+    output_csv = f"{args.output_dir}/{get_filename(args.input_csv)}.{args.model_name}.csv"
+    measure(output_csv, 0, ref)
